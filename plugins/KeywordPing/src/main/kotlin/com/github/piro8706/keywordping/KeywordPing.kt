@@ -9,22 +9,30 @@ import android.view.View
 import android.widget.TextView
 import com.aliucord.Utils
 import com.aliucord.annotations.AliucordPlugin
+import com.aliucord.api.NotificationsAPI
 import com.aliucord.api.SettingsAPI
+import com.aliucord.entities.NotificationData
 import com.aliucord.entities.Plugin
-import com.aliucord.patcher.after
+import com.aliucord.patcher.before
 import com.aliucord.views.TextInput
 import com.aliucord.widgets.BottomSheet
 import com.aliucord.wrappers.ChannelWrapper.Companion.guildId
+import com.aliucord.wrappers.ChannelWrapper.Companion.name
 import com.aliucord.wrappers.users.globalName
 import com.discord.models.user.CoreUser
 import com.discord.stores.StoreStream
+import com.discord.utilities.user.UserUtils
+import com.discord.views.CheckedSetting
 import java.util.regex.Pattern
 import com.discord.api.message.Message as ApiMessage
+import com.discord.api.user.User as ApiUser
 import com.discord.models.message.Message as ModelMessage
 
 private const val KEY_KEYWORDS = "keywords"
 private const val KEY_VIPS = "vips"
 private const val KEY_IGNORED = "ignoredGuilds"
+private const val KEY_NATIVE = "nativeMention"
+private const val KEY_POPUP = "popup"
 
 sealed class Scope {
     object All : Scope()
@@ -120,6 +128,17 @@ class KeywordPingSettings(private val settings: SettingsAPI) : BottomSheet() {
         addBox("Keywords (one per line)", KEY_KEYWORDS)
         addBox("VIP users (name or user id)", KEY_VIPS)
         addBox("Ignored server IDs", KEY_IGNORED)
+        addSwitch("Real mention (badge + Discord notification)", KEY_NATIVE)
+        addSwitch("Show in-app popup banner", KEY_POPUP)
+    }
+
+    private fun addSwitch(label: String, key: String) {
+        val sw = Utils.createCheckedSetting(requireContext(), CheckedSetting.ViewType.SWITCH, label, null)
+        sw.isChecked = settings.getBool(key, true)
+        sw.setOnCheckedListener {
+            settings.setBool(key, !settings.getBool(key, true))
+        }
+        addView(sw)
     }
 
     private fun addBox(hint: String, key: String) {
@@ -148,12 +167,12 @@ class KeywordPing : Plugin() {
         settingsTab = SettingsTab(KeywordPingSettings::class.java, SettingsTab.Type.BOTTOM_SHEET)
             .withArgs(settings)
 
-        // Same hook Aliucord's own core plugins use for new messages
-        patcher.after<StoreStream>(
+        // "before" so we can modify the message before Discord's stores process it
+        patcher.before<StoreStream>(
             "handleMessageCreate",
             ApiMessage::class.java,
         ) { param ->
-            val apiMsg = param.args[0] as? ApiMessage ?: return@after
+            val apiMsg = param.args[0] as? ApiMessage ?: return@before
             onMessage(apiMsg)
         }
     }
@@ -175,6 +194,7 @@ class KeywordPing : Plugin() {
             val channel = StoreStream.getChannels().getChannel(channelId)
             val guildId = channel?.guildId?.takeIf { it != 0L }
 
+            val authorName = author.globalName ?: author.username ?: "Someone"
             val names = setOfNotNull(
                 author.username?.lowercase(),
                 author.globalName?.lowercase(),
@@ -189,10 +209,49 @@ class KeywordPing : Plugin() {
             )
             val reason = evaluate(cfg, incoming) ?: return
 
-            // Toast only. A real Discord mention (badge/push/Inbox) is not done yet.
-            Utils.showToast("KeywordPing: $reason")
+            val nativeOk = settings.getBool(KEY_NATIVE, true) && injectMention(apiMsg)
+
+            // Show the banner if enabled, or as a fallback when the real mention didn't work
+            if (settings.getBool(KEY_POPUP, true) || !nativeOk) {
+                val channelName = channel?.name?.takeIf { it.isNotEmpty() }
+                showPopup(authorName, channelName, content, channelId, reason)
+            }
         } catch (t: Throwable) {
             logger.warn("KeywordPing: error handling message: ${t.message}")
+        }
+    }
+
+    // Adds you to the message's mention list so Discord treats it as a real @mention.
+    private fun injectMention(apiMsg: ApiMessage): Boolean {
+        return try {
+            val me = StoreStream.getUsers().me
+            val field = ApiMessage::class.java.getDeclaredField("mentions")
+            field.isAccessible = true
+            val old = (field.get(apiMsg) as? List<*>) ?: emptyList<Any?>()
+            val already = old.any { it is ApiUser && CoreUser(it).id == me.id }
+            if (!already) {
+                val updated = ArrayList<Any?>(old)
+                updated.add(UserUtils.INSTANCE.synthesizeApiUser(me))
+                field.set(apiMsg, updated)
+            }
+            true
+        } catch (t: Throwable) {
+            logger.warn("KeywordPing: could not add real mention: ${t.message}")
+            false
+        }
+    }
+
+    private fun showPopup(author: String, channelName: String?, content: String, channelId: Long, reason: String) {
+        Utils.mainThread.post {
+            try {
+                val data = NotificationData()
+                    .setTitle(if (channelName != null) "$author in #$channelName" else author)
+                    .setSubtitle("KeywordPing: $reason")
+                    .setBody(content)
+                NotificationsAPI.display(data, channelId)
+            } catch (t: Throwable) {
+                logger.warn("KeywordPing: could not show popup: ${t.message}")
+            }
         }
     }
 }
