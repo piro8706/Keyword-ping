@@ -14,8 +14,12 @@ import com.aliucord.entities.Plugin
 import com.aliucord.patcher.after
 import com.aliucord.views.TextInput
 import com.aliucord.widgets.BottomSheet
-import com.discord.api.message.Message
-import com.discord.stores.StoreMessages
+import com.aliucord.wrappers.ChannelWrapper.Companion.guildId
+import com.aliucord.wrappers.users.globalName
+import com.discord.models.user.CoreUser
+import com.discord.stores.StoreStream
+import com.discord.api.message.Message as ApiMessage
+import com.discord.models.message.Message as ModelMessage
 
 private const val KEY_KEYWORDS = "keywords"
 private const val KEY_VIPS = "vips"
@@ -80,7 +84,9 @@ fun evaluate(cfg: Config, msg: IncomingMessage): String? {
     if (msg.guildId != null && msg.guildId in cfg.ignoredGuilds) return null
     if (cfg.vips.isNotEmpty() &&
         (msg.authorId.toString() in cfg.vips || msg.authorNames.any { it in cfg.vips })
-    ) return "VIP user"
+    ) {
+        return "VIP user"
+    }
     for (r in cfg.rules) {
         val inScope = when (val s = r.scope) {
             is Scope.Any -> true
@@ -122,20 +128,19 @@ class KeywordPingSettings(private val settings: SettingsAPI) : BottomSheet() {
     }
 }
 
-@AliucordPlugin
+@AliucordPlugin(requiresRestart = false)
+@Suppress("unused")
 class KeywordPing : Plugin() {
     override fun start(context: Context) {
         settingsTab = SettingsTab(KeywordPingSettings::class.java, SettingsTab.Type.BOTTOM_SHEET)
             .withArgs(settings)
 
-        // UNVERIFIED: my guess at the "new message" method. If wrong, the plugin
-        // still loads, logs a warning, and never fires.
-        try {
-            patcher.after<StoreMessages>("handleMessageCreate", Message::class.java) { param ->
-                onMessage(param.args[0])
-            }
-        } catch (t: Throwable) {
-            logger.warn("KeywordPing: could not hook message create: ${t.message}")
+        // Same hook Aliucord's own core plugins use for new messages
+        patcher.after<StoreStream>(
+            "handleMessageCreate",
+            ApiMessage::class.java,
+        ) { (_, apiMsg: ApiMessage) ->
+            onMessage(apiMsg)
         }
     }
 
@@ -143,40 +148,37 @@ class KeywordPing : Plugin() {
         patcher.unpatchAll()
     }
 
-    private fun onMessage(raw: Any?) {
+    fun onMessage(apiMsg: ApiMessage) {
         try {
-            val msg = extract(raw) ?: return
+            val msg = ModelMessage(apiMsg)
+            val content = msg.content ?: return
+            val author = CoreUser(msg.author)
+
+            // Don't ping on your own messages
+            if (author.id == StoreStream.getUsers().me.id) return
+
+            val channelId = msg.channelId
+            val channel = StoreStream.getChannels().getChannel(channelId)
+            val guildId = channel?.guildId?.takeIf { it != 0L }
+
+            val names = setOfNotNull(
+                author.username?.lowercase(),
+                author.globalName?.lowercase(),
+            )
+            val incoming = IncomingMessage(content, author.id, names, channelId, guildId)
+
             val cfg = Config(
                 rules = parseRules(settings.getString(KEY_KEYWORDS, "")),
                 vips = parseLines(settings.getString(KEY_VIPS, "")),
                 ignoredGuilds = parseLines(settings.getString(KEY_IGNORED, ""))
                     .mapNotNull { it.toLongOrNull() }.toSet(),
             )
-            val reason = evaluate(cfg, msg) ?: return
+            val reason = evaluate(cfg, incoming) ?: return
+
+            // Toast only. A real Discord mention (badge/push/Inbox) is not done yet.
             Utils.showToast("KeywordPing: $reason")
         } catch (t: Throwable) {
             logger.warn("KeywordPing: error handling message: ${t.message}")
         }
-    }
-
-    private fun extract(m: Any?): IncomingMessage? {
-        if (m == null) return null
-        val content = m.read("getContent", "i") as? String ?: return null
-        val channelId = (m.read("getChannelId", "g") as? Number)?.toLong() ?: return null
-        val guildId = (m.read("getGuildId", "h") as? Number)?.toLong()
-        val author = m.read("getAuthor", "e")
-        val authorId = (author?.read("getId", "i") as? Number)?.toLong() ?: 0L
-        val username = (author?.read("getUsername", "r") as? String)?.lowercase()
-        return IncomingMessage(content, authorId, setOfNotNull(username), channelId, guildId)
-    }
-
-    private fun Any.read(vararg names: String): Any? {
-        for (n in names) {
-            try {
-                return javaClass.getMethod(n).invoke(this)
-            } catch (_: Throwable) {
-            }
-        }
-        return null
     }
 }
