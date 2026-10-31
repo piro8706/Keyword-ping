@@ -18,6 +18,7 @@ import com.aliucord.wrappers.ChannelWrapper.Companion.guildId
 import com.aliucord.wrappers.users.globalName
 import com.discord.models.user.CoreUser
 import com.discord.stores.StoreStream
+import java.util.regex.Pattern
 import com.discord.api.message.Message as ApiMessage
 import com.discord.models.message.Message as ModelMessage
 
@@ -26,46 +27,55 @@ private const val KEY_VIPS = "vips"
 private const val KEY_IGNORED = "ignoredGuilds"
 
 sealed class Scope {
-    object Any : Scope()
+    object All : Scope()
     data class User(val name: String) : Scope()
     data class Channel(val id: Long) : Scope()
     data class Guild(val id: Long) : Scope()
 }
 
-class Rule(val scope: Scope, val matcher: Regex)
+class Rule(val scope: Scope, val pattern: Pattern)
 
-private val scopedLine = Regex("""^(@[^:\s]+|#\d+|\d{15,}):(.+)$""")
-private val regexLiteral = Regex("""^/(.+)/([gimsu]*)$""")
+// Java regex is used on purpose: Discord's bundled copy of Kotlin's Regex clashes at compile time.
+private val scopedLine: Pattern = Pattern.compile("^(@[^:\\s]+|#\\d+|\\d{15,}):(.+)$")
+private val regexLiteral: Pattern = Pattern.compile("^/(.+)/([gimsu]*)$")
 
 fun parseRule(line: String): Rule? {
     val text = line.trim()
     if (text.isEmpty()) return null
-    var scope: Scope = Scope.Any
+
+    var scope: Scope = Scope.All
     var body = text
-    scopedLine.matchEntire(text)?.let { m ->
-        val prefix = m.groupValues[1]
+    val sm = scopedLine.matcher(text)
+    if (sm.matches()) {
+        val prefix = sm.group(1) ?: return null
         scope = when {
-            prefix.startsWith("@") -> Scope.User(prefix.drop(1).lowercase())
-            prefix.startsWith("#") -> Scope.Channel(prefix.drop(1).toLongOrNull() ?: return null)
+            prefix.startsWith("@") -> Scope.User(prefix.substring(1).lowercase())
+            prefix.startsWith("#") -> Scope.Channel(prefix.substring(1).toLongOrNull() ?: return null)
             else -> Scope.Guild(prefix.toLongOrNull() ?: return null)
         }
-        body = m.groupValues[2]
+        body = sm.group(2) ?: return null
     }
-    val literal = regexLiteral.matchEntire(body)
-    val matcher = if (literal != null) {
-        val flags = literal.groupValues[2]
-        val opts = mutableSetOf<RegexOption>()
-        if ('i' in flags) opts += RegexOption.IGNORE_CASE
-        if ('m' in flags) opts += RegexOption.MULTILINE
-        if ('s' in flags) opts += RegexOption.DOT_MATCHES_ALL
-        runCatching { Regex(literal.groupValues[1], opts) }.getOrNull() ?: return null
+
+    val lm = regexLiteral.matcher(body)
+    val pattern: Pattern = if (lm.matches()) {
+        val expr = lm.group(1) ?: return null
+        val flags = lm.group(2) ?: ""
+        var f = 0
+        if (flags.indexOf('i') >= 0) f = f or Pattern.CASE_INSENSITIVE
+        if (flags.indexOf('m') >= 0) f = f or Pattern.MULTILINE
+        if (flags.indexOf('s') >= 0) f = f or Pattern.DOTALL
+        try {
+            Pattern.compile(expr, f)
+        } catch (e: Exception) {
+            return null
+        }
     } else {
-        Regex("(?<!\\w)" + Regex.escape(body) + "(?!\\w)", RegexOption.IGNORE_CASE)
+        Pattern.compile("(?<!\\w)" + Pattern.quote(body) + "(?!\\w)", Pattern.CASE_INSENSITIVE)
     }
-    return Rule(scope, matcher)
+    return Rule(scope, pattern)
 }
 
-fun parseRules(raw: String): List<Rule> = raw.lineSequence().mapNotNull(::parseRule).toList()
+fun parseRules(raw: String): List<Rule> = raw.lineSequence().mapNotNull { parseRule(it) }.toList()
 
 fun parseLines(raw: String): Set<String> =
     raw.lineSequence().map { it.trim().lowercase() }.filter { it.isNotEmpty() }.toSet()
@@ -89,12 +99,15 @@ fun evaluate(cfg: Config, msg: IncomingMessage): String? {
     }
     for (r in cfg.rules) {
         val inScope = when (val s = r.scope) {
-            is Scope.Any -> true
+            is Scope.All -> true
             is Scope.User -> s.name in msg.authorNames
             is Scope.Channel -> s.id == msg.channelId
             is Scope.Guild -> s.id == msg.guildId
         }
-        if (inScope) r.matcher.find(msg.content)?.let { return "matched \"${it.value}\"" }
+        if (inScope) {
+            val m = r.pattern.matcher(msg.content)
+            if (m.find()) return "matched \"" + m.group() + "\""
+        }
     }
     return null
 }
@@ -139,7 +152,8 @@ class KeywordPing : Plugin() {
         patcher.after<StoreStream>(
             "handleMessageCreate",
             ApiMessage::class.java,
-        ) { (_, apiMsg: ApiMessage) ->
+        ) { param ->
+            val apiMsg = param.args[0] as? ApiMessage ?: return@after
             onMessage(apiMsg)
         }
     }
