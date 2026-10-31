@@ -128,15 +128,15 @@ class KeywordPingSettings(private val settings: SettingsAPI) : BottomSheet() {
         addBox("Keywords (one per line)", KEY_KEYWORDS)
         addBox("VIP users (name or user id)", KEY_VIPS)
         addBox("Ignored server IDs", KEY_IGNORED)
-        addSwitch("Real mention (badge + Discord notification)", KEY_NATIVE)
-        addSwitch("Show in-app popup banner", KEY_POPUP)
+        addSwitch("Real mention (badge + Discord notification)", KEY_NATIVE, true)
+        addSwitch("Also show in-app popup banner", KEY_POPUP, false)
     }
 
-    private fun addSwitch(label: String, key: String) {
+    private fun addSwitch(label: String, key: String, default: Boolean) {
         val sw = Utils.createCheckedSetting(requireContext(), CheckedSetting.ViewType.SWITCH, label, null)
-        sw.isChecked = settings.getBool(key, true)
+        sw.isChecked = settings.getBool(key, default)
         sw.setOnCheckedListener {
-            settings.setBool(key, !settings.getBool(key, true))
+            settings.setBool(key, !settings.getBool(key, default))
         }
         addView(sw)
     }
@@ -211,8 +211,8 @@ class KeywordPing : Plugin() {
 
             val nativeOk = settings.getBool(KEY_NATIVE, true) && injectMention(apiMsg)
 
-            // Show the banner if enabled, or as a fallback when the real mention didn't work
-            if (settings.getBool(KEY_POPUP, true) || !nativeOk) {
+            // Banner only if you turned it on, or as a backup when the real mention failed
+            if (settings.getBool(KEY_POPUP, false) || !nativeOk) {
                 val channelName = channel?.name?.takeIf { it.isNotEmpty() }
                 showPopup(authorName, channelName, content, channelId, reason)
             }
